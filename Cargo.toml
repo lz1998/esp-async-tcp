@@ -1,5 +1,5 @@
 [package]
-name = "esp32-async-tcp"
+name = "esp-async-tcp"
 version = "0.1.0"
 edition = "2021"
 
