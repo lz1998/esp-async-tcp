@@ -62,7 +62,10 @@ fn cvt(n: core::ffi::c_int) -> Result<core::ffi::c_int, IOError> {
 fn cvt_poll(n: core::ffi::c_int) -> Poll<Result<core::ffi::c_int, IOError>> {
     if n < 0 {
         let errno = core::mem::replace(unsafe { &mut *esp_idf_sys::__errno() }, 0);
-        if errno == esp_idf_sys::EAGAIN as i32 || errno == esp_idf_sys::EWOULDBLOCK as i32 {
+        if errno == esp_idf_sys::EAGAIN as i32
+            || errno == esp_idf_sys::EWOULDBLOCK as i32
+            || errno == esp_idf_sys::EINPROGRESS as i32
+        {
             Poll::Pending
         } else {
             Poll::Ready(Err(errno))
@@ -127,6 +130,20 @@ impl Socket {
         } as i32)
     }
 
+    // events: POLLOUT|POLLIN|POLLERR
+    pub fn poll_ready(&self, events: i16, timeout: i32) -> Poll<Result<i16, IOError>> {
+        let mut poll_fd = esp_idf_sys::pollfd {
+            fd: self.0,
+            events,
+            ..Default::default()
+        };
+        cvt(unsafe { esp_idf_sys::lwip_poll(&mut poll_fd, 1, timeout) })?;
+        match poll_fd.revents {
+            0 => Poll::Pending,
+            other => Poll::Ready(Ok(other)),
+        }
+    }
+
     pub fn setsockopt<T>(
         &self,
         level: core::ffi::c_int,
@@ -155,9 +172,31 @@ impl Drop for Socket {
 }
 
 impl TcpStream {
+    pub async fn connect(addr: &SocketAddr) -> Result<Self, IOError> {
+        let sock = Socket::new(addr, esp_idf_sys::SOCK_STREAM as core::ffi::c_int)?;
+        sock.set_nonblocking()?;
+        let (addr, addr_len) = addr.into_inner();
+        match cvt(unsafe { esp_idf_sys::lwip_connect(sock.0, addr.as_ptr(), addr_len) }) {
+            Ok(_) => unreachable!(),
+            Err(err)
+                if err == esp_idf_sys::EWOULDBLOCK as i32
+                    || err == esp_idf_sys::EINPROGRESS as i32 => {}
+            Err(other) => return Err(other),
+        }
+        future::poll_fn(|_cx| {
+            sock.poll_ready(
+                (esp_idf_sys::POLLOUT | esp_idf_sys::POLLIN | esp_idf_sys::POLLERR) as i16,
+                0,
+            )
+        })
+        .await?;
+        Ok(TcpStream { inner: sock })
+    }
+
     pub async fn read(&self, buf: &mut [u8]) -> Result<i32, IOError> {
         future::poll_fn(|_cx| self.inner.poll_read(buf)).await
     }
+
     pub async fn write(&self, buf: &[u8]) -> Result<i32, IOError> {
         future::poll_fn(|_cx| self.inner.poll_write(buf)).await
     }
