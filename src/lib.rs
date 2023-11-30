@@ -130,6 +130,20 @@ impl Socket {
         } as i32)
     }
 
+    // events: POLLOUT|POLLIN|POLLERR
+    pub fn poll_ready(&self, events: i16, timeout: i32) -> Poll<Result<i16, IOError>> {
+        let mut poll_fd = esp_idf_sys::pollfd {
+            fd: self.0,
+            events,
+            ..Default::default()
+        };
+        cvt(unsafe { esp_idf_sys::lwip_poll(&mut poll_fd, 1, timeout) })?;
+        match poll_fd.revents {
+            0 => Poll::Pending,
+            other => Poll::Ready(Ok(other)),
+        }
+    }
+
     pub fn setsockopt<T>(
         &self,
         level: core::ffi::c_int,
@@ -158,7 +172,7 @@ impl Drop for Socket {
 }
 
 impl TcpStream {
-    pub fn connect(addr: &SocketAddr) -> Result<Self, IOError> {
+    pub async fn connect(addr: &SocketAddr) -> Result<Self, IOError> {
         let sock = Socket::new(addr, esp_idf_sys::SOCK_STREAM as core::ffi::c_int)?;
         sock.set_nonblocking()?;
         let (addr, addr_len) = addr.into_inner();
@@ -169,6 +183,13 @@ impl TcpStream {
                     || err == esp_idf_sys::EINPROGRESS as i32 => {}
             Err(other) => return Err(other),
         }
+        future::poll_fn(|_cx| {
+            sock.poll_ready(
+                (esp_idf_sys::POLLOUT | esp_idf_sys::POLLIN | esp_idf_sys::POLLERR) as i16,
+                0,
+            )
+        })
+        .await?;
         Ok(TcpStream { inner: sock })
     }
 
