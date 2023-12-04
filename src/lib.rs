@@ -1,5 +1,6 @@
 #![no_std]
 #![feature(ip_in_core)]
+#![feature(async_fn_in_trait)]
 
 mod inner;
 
@@ -12,7 +13,8 @@ use core::task::Poll;
 #[derive(Debug)]
 pub struct Socket(core::ffi::c_int);
 
-type IOError = core::ffi::c_int;
+#[derive(Debug, Copy, Clone)]
+pub struct IOError(i32);
 
 #[derive(Debug)]
 pub struct TcpStream {
@@ -50,10 +52,10 @@ impl TcpListener {
 
 fn cvt(n: core::ffi::c_int) -> Result<core::ffi::c_int, IOError> {
     if n < 0 {
-        Err(core::mem::replace(
+        Err(IOError(core::mem::replace(
             unsafe { &mut *esp_idf_sys::__errno() },
             0,
-        ))
+        )))
     } else {
         Ok(n)
     }
@@ -68,7 +70,7 @@ fn cvt_poll(n: core::ffi::c_int) -> Poll<Result<core::ffi::c_int, IOError>> {
         {
             Poll::Pending
         } else {
-            Poll::Ready(Err(errno))
+            Poll::Ready(Err(IOError(errno)))
         }
     } else {
         Poll::Ready(Ok(n))
@@ -179,8 +181,8 @@ impl TcpStream {
         match cvt(unsafe { esp_idf_sys::lwip_connect(sock.0, addr.as_ptr(), addr_len) }) {
             Ok(_) => unreachable!(),
             Err(err)
-                if err == esp_idf_sys::EWOULDBLOCK as i32
-                    || err == esp_idf_sys::EINPROGRESS as i32 => {}
+                if err.0 == esp_idf_sys::EWOULDBLOCK as i32
+                    || err.0 == esp_idf_sys::EINPROGRESS as i32 => {}
             Err(other) => return Err(other),
         }
         future::poll_fn(|_cx| {
@@ -193,13 +195,13 @@ impl TcpStream {
         Ok(TcpStream { inner: sock })
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> Result<i32, IOError> {
-        future::poll_fn(|_cx| self.inner.poll_read(buf)).await
-    }
-
-    pub async fn write(&self, buf: &[u8]) -> Result<i32, IOError> {
-        future::poll_fn(|_cx| self.inner.poll_write(buf)).await
-    }
+    // pub async fn read(&self, buf: &mut [u8]) -> Result<i32, IOError> {
+    //     future::poll_fn(|_cx| self.inner.poll_read(buf)).await
+    // }
+    //
+    // pub async fn write(&self, buf: &[u8]) -> Result<i32, IOError> {
+    //     future::poll_fn(|_cx| self.inner.poll_write(buf)).await
+    // }
 }
 
 pub(crate) fn sockaddr_to_addr(
@@ -219,6 +221,31 @@ pub(crate) fn sockaddr_to_addr(
                 *(storage as *const _ as *const esp_idf_sys::sockaddr_in6)
             })))
         }
-        _ => Err(-1),
+        _ => Err(IOError(-1)),
+    }
+}
+
+impl embedded_io_async::Error for IOError {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        embedded_io_async::ErrorKind::Other
+    }
+}
+impl embedded_io_async::ErrorType for TcpStream {
+    type Error = IOError;
+}
+
+impl embedded_io_async::Write for TcpStream {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        future::poll_fn(|_cx| self.inner.poll_write(buf))
+            .await
+            .map(|r| r as usize)
+    }
+}
+
+impl embedded_io_async::Read for TcpStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        future::poll_fn(|_cx| self.inner.poll_read(buf))
+            .await
+            .map(|r| r as usize)
     }
 }
